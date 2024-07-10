@@ -1,6 +1,8 @@
 # Bluetooth Serial Port to MQTT Bridge
 This project is intended to be used in conjunction with --Ambrogio Mower Controller (link coming soon)-- in order to allow control of AM4000 based mowers via WiFi (and Home Assistant). It connects to your mower via Bluetooth and relays serial data to an MQTT broker.
 
+<img src="./img/AM4000Controller.png">
+
 # Disclaimer
 Any useage of this project's software and hardware are at your own risk. This includes any damage done to you or your equipment as well as the loss of warranty when the mower is opened by a non-authorized person.
 
