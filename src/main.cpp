@@ -5,7 +5,10 @@
 #include <IotWebConfESP32HTTPUpdateServer.h>
 #include <BluetoothSerial.h>
 #include <Regexp.h>
+#include <ArduinoJSON.h>
+#include <AM4000.h>
 
+static const char* TAG = "BTMQTTBridge";
 
 // -- Initial name of the Thing. Used e.g. as SSID of the own Access Point.
 const char thingName[] = "AmbrogioBTSerialBridge";
@@ -40,12 +43,22 @@ void btDataAvailable(const uint8_t *buffer, size_t size);
 void writeToBluetoothSerial(const uint8_t *buffer, size_t size);
 void handleBtDeviceFound(BTAdvertisedDevice *device);
 
+// Mower notification callbacks
+void handleInfoMessage(AM4000_Info);
+void handleStateMessage(AM4000_State);
+void handleMessageMessage(AM4000_Message);
+void handleFailureMessage(AM4000_Failure);
+void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, uint8_t dayIndex, uint8_t areaIndex);
+
+void mqttLog(String message);
+
 DNSServer dnsServer;
 WebServer server(80);
 HTTPUpdateServer httpUpdater;
 WiFiClient net;
 MQTTClient mqttClient(256); //128 is default but payloads can be up to 256
 BluetoothSerial SerialBT;
+AM4000 mower;
 
 char mqttServerValue[STRING_LEN];
 char mqttUserNameValue[STRING_LEN];
@@ -58,6 +71,9 @@ char mowerConnectValue[STRING_LEN];
 String mqttTopic;
 String mqttTopicSerialOut;
 String mqttTopicSerialIn;
+String mqttTopicJSONIn;
+String mqttTopicJSONOut;
+String mqttTopicLog;
 
 uint8_t mowerAddress[6]; //replace with entry from config
 bool btConnected = false; 
@@ -117,6 +133,9 @@ void setup()
   mqttTopic = String(mqttPrefixValue) + "/" + String(iotWebConf.getThingName());
   mqttTopicSerialIn = mqttTopic + "/serialin";
   mqttTopicSerialOut = mqttTopic + "/serialout";
+  mqttTopicJSONIn = mqttTopic + "/command";
+  mqttTopicJSONOut = mqttTopic + "/state";
+  mqttTopicLog = mqttTopic + "/log";
 
    // -- Define how to handle updateServer calls.
   iotWebConf.setupUpdateServer(
@@ -132,7 +151,19 @@ void setup()
   mqttClient.begin(mqttServerValue, net);
   mqttClient.onMessageAdvanced(mqttMessageReceived);
 
+
+  //set callbacks to pass data back and forth between the library and the bluetooth mower connection.
+  mower.setSerialDataOutputCallack(writeToBluetoothSerial);
   SerialBT.onData(btDataAvailable);
+
+  //set callbacks for all the message types coming from the mower (via the library)
+  mower.setNotificationInfoCallback(handleInfoMessage);
+  mower.setNotificationStateCallback(handleStateMessage);
+  mower.setNotificationFailureCallback(handleFailureMessage);
+  mower.setNotificationMessageCallback(handleMessageMessage);
+  mower.setNotificationCommandResponseCallback(handleCommandResponse);
+
+
   SerialBT.begin("Ambrogio BTSerial Bridge", true);
 
   Serial.println("Ready.");
@@ -166,6 +197,7 @@ void loop()
 
   if(btConnected && !SerialBT.connected()){ //BT Serial connection has become disconnected
   Serial.println("BT Serial connection closed");
+  mqttLog("Bluetooth connection was unexpectedly closed");
   btConnected = SerialBT.connected();
   }
 
@@ -176,8 +208,10 @@ if(mowerConnectParam.isChecked() && !btConnected && mqttClient.connected() && (l
       char result = ms.Match("^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]$");
     if (result == REGEXP_MATCHED)
     { 
-      Serial.print("Attempting to connect to mower by MAC: ");
-      Serial.println(mowerMacAddressValue);
+      String msg = "Attempting to connect to mower by MAC: " + String(mowerMacAddressValue);
+      Serial.print(msg);
+      mqttLog(msg);
+      
 
       sscanf(mowerMacAddressValue, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mowerAddress[0], &mowerAddress[1], &mowerAddress[2], &mowerAddress[3], &mowerAddress[4], &mowerAddress[5]);
         char* ptr; //start and end pointer for strtol
@@ -202,11 +236,13 @@ if(mowerConnectParam.isChecked() && !btConnected && mqttClient.connected() && (l
   
   if(SerialBT.connected()){//connection has been made successfully
     Serial.println("Connected Succesfully!");
+    mqttLog("Successfully connected to Bluetooth Device");
     btConnected = SerialBT.connected();
   }
 }
 else if(!mowerConnectParam.isChecked() && btConnected){//we are connected but should be disconnected
     SerialBT.disconnect();
+    mqttLog("Bluetooth disconnected");
 }
   
 }
@@ -281,6 +317,7 @@ bool connectMqtt() {
   Serial.println("Connected!");
 
   mqttClient.subscribe(mqttTopicSerialIn);
+  mqttClient.subscribe(mqttTopicJSONIn);
   return true;
 }
 
@@ -311,6 +348,25 @@ void mqttMessageReceived(MQTTClient *client, char topic[], char bytes[], int len
     memcpy(data,bytes,length);
     SerialBT.write(data,length);
     }
+    else if(strcmp(topic, mqttTopicJSONIn.c_str()) == 0){
+      JsonDocument command;
+      DeserializationError error = deserializeJson(command, bytes, length);
+
+      if (error) {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.f_str());
+        return;
+      }
+      if(command["cmnd"] == "play" ){
+        mower.play();
+      }
+      if(command["cmnd"] == "pause" ){
+        mower.pause();
+      }
+      if(command["cmnd"] == "home" ){
+        mower.goHome();
+      }
+    }
 }
 
 void btDataAvailable(const uint8_t *buffer, size_t size){
@@ -321,9 +377,12 @@ void btDataAvailable(const uint8_t *buffer, size_t size){
   //sometimes 2 frames of data can come in together, so split them up
   for(size_t i = 0; i < size; i++ ){
     if(buffer[i] == 0x03){
-      char packet[i - frameStart + 1];
-      memcpy(packet,buffer+frameStart,sizeof(packet));
-      mqttClient.publish(mqttTopicSerialOut.c_str(),packet,sizeof(packet));
+      uint8_t length = i - frameStart + 1;
+      uint8_t packet[length];
+      memcpy(packet,buffer+frameStart,length);
+      //mqttClient.publish(mqttTopicSerialOut.c_str(),packet,length);
+      ESP_LOGD(TAG, "Sending data received from mower to library" );
+      mower.serialInput(packet,length);
       frameStart = i + 1;
     }
   } 
@@ -350,4 +409,52 @@ void handleBtDeviceFound(BTAdvertisedDevice *device){
       scanOutput += device->getAddress().toString(true);
       scanOutput += " - ";
       scanOutput += device->getName().c_str();
+}
+
+void handleInfoMessage(AM4000_Info info){
+  JsonDocument doc;
+  doc["typ"] = "info";
+  doc["volt"] = info._batteryVoltage;
+  doc["batt"] = info._batteryPercent;
+  doc["curr"] = info._current;
+  char buffer[256];
+  size_t n = serializeJson(doc,buffer);
+  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+}
+
+void handleStateMessage(AM4000_State state){
+  JsonDocument doc;
+  doc["type"] = "stat";
+  doc["stat"] = stateToString[state];
+  char buffer[256];
+  size_t n = serializeJson(doc,buffer);
+  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+}
+
+void handleMessageMessage(AM4000_Message message){
+  JsonDocument doc;
+  doc["type"] = "mesg";
+  doc["mesg"] = messageToString[message];
+  char buffer[256];
+  size_t n = serializeJson(doc,buffer);
+  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+}
+
+void handleFailureMessage(AM4000_Failure failure){
+  JsonDocument doc;
+  doc["type"] = "fail";
+  doc["fail"] = failureToString[failure];
+  char buffer[256];
+  size_t n = serializeJson(doc,buffer);
+  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+}
+
+void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, uint8_t dayIndex, uint8_t areaIndex){
+
+}
+
+void mqttLog(String message){
+  if(mqttClient.connected()){
+    mqttClient.publish(mqttTopicLog.c_str(),message);
+  }
 }
