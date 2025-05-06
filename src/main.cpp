@@ -49,6 +49,8 @@ void handleStateMessage(AM4000_State);
 void handleMessageMessage(AM4000_Message);
 void handleFailureMessage(AM4000_Failure);
 void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, uint8_t dayIndex, uint8_t areaIndex);
+void handleSettingsProfile(AM4000_SettingsProfile);
+void handleSettingsMisc(AM4000_SettingsMisc);
 
 void mqttLog(String message);
 
@@ -238,6 +240,7 @@ if(mowerConnectParam.isChecked() && !btConnected && mqttClient.connected() && (l
     Serial.println("Connected Succesfully!");
     mqttLog("Successfully connected to Bluetooth Device");
     btConnected = SerialBT.connected();
+    mower.requestScheduleRefresh(0,1);
   }
 }
 else if(!mowerConnectParam.isChecked() && btConnected){//we are connected but should be disconnected
@@ -450,6 +453,43 @@ void handleFailureMessage(AM4000_Failure failure){
 }
 
 void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, uint8_t dayIndex, uint8_t areaIndex){
+  Serial.println("handling command response");
+ if(commandType == COMMS_SCHEDULE_SETTINGS_GET){
+  Serial.println("command response is a schedule");
+  JsonDocument doc;
+  doc["type"] = "sche";
+  doc["idx"] = profileIndex;
+  doc["day"] = areaIndex;
+  doc["rain"] = mower.getSettingsProfile(profileIndex)._settingsRobot._rainSensor;
+  JsonArray areas = doc.add<JsonArray>();
+  for(uint8_t i=0;i<=3;i++){
+    JsonObject area = areas.add<JsonObject>();
+    area["bh"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._startHour;
+    area["bm"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._startMinute;
+    area["eh"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._stopHour;
+    area["em"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._stopMinute;
+    String areas;
+    areas = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area1 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area2 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area3 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area4 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area5 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area6 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area7 ? "Y" : "N";
+    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area8 ? "Y" : "N";
+    area["ar"] = areas;
+    area["bo"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._borderCut ? "Y" : "N";
+  }
+  char buffer[256];
+  size_t n = serializeJson(doc,buffer);
+  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+ }
+}
+
+void handleSettingsProfile(uint8_t profile){
+
+}
+void handleSettingsMisc(AM4000_SettingsMisc misc){
 
 }
 
