@@ -1,42 +1,35 @@
 #include <Arduino.h>
-#include <MQTT.h>
-#include <IotWebConf.h>
-#include <IotWebConfUsing.h> // This loads aliases for easier class names.
-#include <IotWebConfESP32HTTPUpdateServer.h>
 #include <BluetoothSerial.h>
 #include <Regexp.h>
-#include <ArduinoJSON.h>
+#include <ArduinoJson.h>
 #include <AM4000.h>
+#include <Preferences.h>
+#include <WiFiManager.h> 
+#include <MQTT.h>
+#include <Meshtastic.h>
 
-static const char* TAG = "BTMQTTBridge";
+Preferences prefs;
+WiFiClient net;
 
-// -- Initial name of the Thing. Used e.g. as SSID of the own Access Point.
-const char thingName[] = "AmbrogioBTSerialBridge";
+static const char* TAG = "BTSerialBridge";
 
-// -- Initial password to connect to the Thing, when it creates an own Access Point.
-const char wifiInitialApPassword[] = "letmein";
+char mower_name[40];
+char mqtt_server[40];
+int mqtt_port;
+char mqtt_username[40];
+char mqtt_password[40];
+char mqtt_topic[40] = "ambrogio";
+char mower_mac[18];
+char checkbox_btConnect[2];
+String customHtml_checkbox = "type=\"checkbox\"";
+long btScanStarted = 0;
+bool resultsReturned = true;
+String scanResults;
 
-#define STRING_LEN 128
-
-// -- Configuration specific key. The value should be modified if config structure was changed.
-#define CONFIG_VERSION "mqt1"
-
-// -- Status indicator pin.
-//      First it will light up (kept LOW), on Wifi connection it will blink,
-//      when connected to the Wifi it will turn off (kept HIGH).
-#define STATUS_PIN LED_BUILTIN
-
-// -- Method declarations.
-void handleRoot();
-void mqttMessageReceived(MQTTClient *client, char topic[], char bytes[], int length);
-bool connectMqtt();
-bool connectMqttOptions();
-// -- Callback methods.
-void wifiConnected();
-void configSaved();
-bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper);
+bool meshAvailable;
 
 void printMsg(char* msg, uint8_t len, uint8_t offset1 = 0, uint8_t offset2 = 0);
+bool validateMAC(char *mac);
 
 // -- Bluetooth callbacks
 void btDataAvailable(const uint8_t *buffer, size_t size);
@@ -52,108 +45,67 @@ void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, ui
 void handleSettingsProfile(AM4000_SettingsProfile);
 void handleSettingsMisc(AM4000_SettingsMisc);
 
-void mqttLog(String message);
+void outputMessage(String msg, bool sendMQTT, bool sendMesh);
+void processCommand(JsonDocument command);
 
-DNSServer dnsServer;
-WebServer server(80);
-HTTPUpdateServer httpUpdater;
-WiFiClient net;
+//mqtt functions
+void mqttMessageReceived(MQTTClient *client, char topic[], char bytes[], int length);
+void connectMqtt();
+bool connectMqttOptions();
+
+void bindServerCallback();
+void handleRoute();
+void saveParamsCallback ();
+
 MQTTClient mqttClient(256); //128 is default but payloads can be up to 256
-BluetoothSerial SerialBT;
-AM4000 mower;
 
-char mqttServerValue[STRING_LEN];
-char mqttUserNameValue[STRING_LEN];
-char mqttUserPasswordValue[STRING_LEN];
-char mqttPrefixValue[STRING_LEN];
-
-char mowerMacAddressValue[18];
-char mowerConnectValue[STRING_LEN];
-
-String mqttTopic;
-String mqttTopicSerialOut;
-String mqttTopicSerialIn;
+String mqttBase;
 String mqttTopicJSONIn;
 String mqttTopicJSONOut;
-String mqttTopicLog;
-
-uint8_t mowerAddress[6]; //replace with entry from config
-bool btConnected = false; 
-long lastBTConnectAttempt; //store the last time a BT connection attempt was made. Used to avoid retrying too often.
-String scanOutput = "No scan output. If there is a valid MAC address set, scanning will not occur."; //placeholder for Bluetooth scann output
-
-IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CONFIG_VERSION);
-
-IotWebConfParameterGroup mqttGroup = IotWebConfParameterGroup("mqtt", "MQTT configuration");
-IotWebConfTextParameter mqttServerParam = IotWebConfTextParameter("MQTT server", "mqttServer", mqttServerValue, STRING_LEN);
-IotWebConfTextParameter mqttUserNameParam = IotWebConfTextParameter("MQTT user", "mqttUser", mqttUserNameValue, STRING_LEN);
-IotWebConfPasswordParameter mqttUserPasswordParam = IotWebConfPasswordParameter("MQTT password", "mqttPass", mqttUserPasswordValue, STRING_LEN);
-IotWebConfTextParameter mqttPrefixParam = IotWebConfTextParameter("MQTT topic prefix (default 'ambrogio')", "mqttPrefix", mqttPrefixValue, STRING_LEN, "ambrogio");
-
-IotWebConfParameterGroup mowerGroup = IotWebConfParameterGroup("mower", "Mower configuration");
-IotWebConfTextParameter mowerMacAddressParam = IotWebConfTextParameter("Mower MAC Address", "mowerMac", mowerMacAddressValue, 18);
-IotWebConfCheckboxParameter mowerConnectParam = IotWebConfCheckboxParameter("Connect to Mower?", "mowerConnect", mowerConnectValue, STRING_LEN, true);
 
 bool needMqttConnect = false;
+
+WiFiManager wm;
+WiFiManagerParameter *custom_mower_name;
+WiFiManagerParameter *custom_mqtt_server;
+WiFiManagerParameter *custom_mqtt_port;
+WiFiManagerParameter *custom_mqtt_username;
+WiFiManagerParameter *custom_mqtt_password;
+WiFiManagerParameter *custom_mqtt_topic;
+WiFiManagerParameter *custom_mower_mac;
+WiFiManagerParameter *custom_btConnect;
+
+BluetoothSerial SerialBT;
+AM4000 mower;
+AM4000_State previousState;
+AM4000_Message previousMessage;
+
+uint8_t mowerAddress[6]; //replace with entry from config
+bool btConnect = false; //Should we be trying to connect to the mower via bluetooth. 
+bool btConnected = false; //has a bluetooth connection been established
+long lastBTConnectAttempt; //store the last time a BT connection attempt was made. Used to avoid retrying too often.
+long lastInfoMessageSent = 0; //If sending over Mesh, we don't need to send every second.
+
 bool needReset = false;
-int pinState = HIGH;
+bool scan = false;
+
 unsigned long lastReport = 0;
 unsigned long lastMqttConnectionAttempt = 0;
 unsigned long lastSentToBt = 0;
+
 
 void setup() 
 {
   Serial.begin(115200);
   Serial.println();
   Serial.println("Starting up...");
+  mt_serial_init(16, 17);
 
-  mqttGroup.addItem(&mqttServerParam);
-  mqttGroup.addItem(&mqttUserNameParam);
-  mqttGroup.addItem(&mqttUserPasswordParam);
-  mqttGroup.addItem(&mqttPrefixParam);
+  WiFi.mode(WIFI_STA);
 
-  mowerGroup.addItem(&mowerMacAddressParam);
-  mowerGroup.addItem(&mowerConnectParam);
-
-  iotWebConf.setStatusPin(STATUS_PIN);
-  iotWebConf.addParameterGroup(&mqttGroup);
-  iotWebConf.addParameterGroup(&mowerGroup);
-  iotWebConf.setConfigSavedCallback(&configSaved);
-  iotWebConf.setFormValidator(&formValidator);
-  iotWebConf.setWifiConnectionCallback(&wifiConnected);
-  iotWebConf.skipApStartup();
-
-  // -- Initializing the configuration.
-  bool validConfig = iotWebConf.init();
-  if (!validConfig)
-  {
-    mqttServerValue[0] = '\0';
-    mqttUserNameValue[0] = '\0';
-    mqttUserPasswordValue[0] = '\0';
-  }
-
-  mqttTopic = String(mqttPrefixValue) + "/" + String(iotWebConf.getThingName());
-  mqttTopicSerialIn = mqttTopic + "/serialin";
-  mqttTopicSerialOut = mqttTopic + "/serialout";
-  mqttTopicJSONIn = mqttTopic + "/command";
-  mqttTopicJSONOut = mqttTopic + "/state";
-  mqttTopicLog = mqttTopic + "/log";
-
-   // -- Define how to handle updateServer calls.
-  iotWebConf.setupUpdateServer(
-    [](const char* updatePath) { httpUpdater.setup(&server, updatePath); },
-    [](const char* userName, char* password) { httpUpdater.updateCredentials(userName, password); });
-
-  // -- Set up required URL handlers on the web server.
-  server.on("/", handleRoot);
-  server.on("/config", []{ iotWebConf.handleConfig(); });
-  server.onNotFound([](){ iotWebConf.handleNotFound(); });
-
-  mqttClient.setKeepAlive(30000);//the default of 10000 is too short when the bluetooth connect is also 10 seconds
-  mqttClient.begin(mqttServerValue, net);
-  mqttClient.onMessageAdvanced(mqttMessageReceived);
-
-
+  prefs.begin("ambrogio");
+  prefs.getBytes("mowerAddress",mowerAddress,6);
+  btConnect = prefs.getBool("btConnect");
   //set callbacks to pass data back and forth between the library and the bluetooth mower connection.
   mower.setSerialDataOutputCallack(writeToBluetoothSerial);
   SerialBT.onData(btDataAvailable);
@@ -165,212 +117,123 @@ void setup()
   mower.setNotificationMessageCallback(handleMessageMessage);
   mower.setNotificationCommandResponseCallback(handleCommandResponse);
 
+  strcpy(mower_name, prefs.getString("mower_name", "mower").c_str());
+  strcpy(mqtt_server, prefs.getString("mqtt_server", "").c_str());
+  mqtt_port = prefs.getInt("mqtt_port", 1883);
+  strcpy(mqtt_username, prefs.getString("mqtt_username", "").c_str());
+  strcpy(mqtt_password, prefs.getString("mqtt_password", "").c_str());
+  strcpy(mqtt_topic, prefs.getString("mqtt_topic", "ambrogio").c_str());
+  sprintf(mower_mac,  "%02X:%02X:%02X:%02X:%02X:%02X", mowerAddress[0], mowerAddress[1], mowerAddress[2], mowerAddress[3], mowerAddress[4],mowerAddress[5]);
+
+  custom_mower_name = new WiFiManagerParameter("mower_name", "Mower Name", mower_name, 40);
+  custom_mqtt_server = new WiFiManagerParameter("server", "MQTT Server", mqtt_server, 40);
+  custom_mqtt_port = new WiFiManagerParameter("port", "MQTT Port", String(mqtt_port).c_str(), 6);
+  custom_mqtt_username = new WiFiManagerParameter("username", "MQTT Username", mqtt_username, 40);
+  custom_mqtt_password = new WiFiManagerParameter("password", "MQTT Password", mqtt_password, 40);//, "type='password'");
+  custom_mqtt_topic = new WiFiManagerParameter("topic", "MQTT Topic", mqtt_topic, 40);
+  custom_mower_mac = new WiFiManagerParameter("mac", "Mower MAC Address", mower_mac, 17);
+    if (btConnect) {
+      customHtml_checkbox += " checked";
+    }
+  custom_btConnect = new WiFiManagerParameter("btConnect", "Connect to Mower", "T", 2, customHtml_checkbox.c_str(), WFM_LABEL_AFTER);
+
+  wm.addParameter(custom_mower_name);
+  wm.addParameter(custom_mqtt_server);
+  wm.addParameter(custom_mqtt_port);
+  wm.addParameter(custom_mqtt_username);
+  wm.addParameter(custom_mqtt_password);
+  wm.addParameter(custom_mqtt_topic);
+  wm.addParameter(custom_mower_mac);
+  wm.addParameter(custom_btConnect);
+
+  wm.setCustomHeadElement("<style>body{max-width:500px;margin:auto}</style>");
+
+  wm.setSaveParamsCallback(saveParamsCallback);
+  wm.setWebServerCallback(bindServerCallback);
+
+  wm.setConfigPortalBlocking(true);
+  if(wm.getWiFiIsSaved()){
+  wm.setConfigPortalTimeout(20);
+  }
+  wm.setAPClientCheck(true);
+  wm.startConfigPortal();
+
+
+  if(wm.getWiFiIsSaved()){
+  //  wm.autoConnect();
+  //} else {
+    WiFi.setAutoReconnect(true);
+    WiFi.begin();
+    wm.setConfigPortalBlocking(false);
+    wm.startWebPortal();
+  }
+
+  mqttBase = String(mqtt_topic) + "/" + String(mower_name) ;
+  mqttTopicJSONIn = mqttBase + "/command";
+  mqttTopicJSONOut = mqttBase + "/state";
+
+  mqttClient.setKeepAlive(30000);//the default of 10000 is too short when the bluetooth connect is also 10 seconds
+  mqttClient.begin(mqtt_server, net);
+  mqttClient.onMessageAdvanced(mqttMessageReceived);
 
   SerialBT.begin("Ambrogio BTSerial Bridge", true);
-
   Serial.println("Ready.");
 }
 
+
 void loop() 
 {
-  // -- doLoop should be called as frequently as possible.
-  iotWebConf.doLoop();
+  wm.process();
   mqttClient.loop();
+  meshAvailable = mt_loop(millis());
   
-  if (needMqttConnect)
+  // if there is an MQTT server configured, it is more than 1 second since we last tried AND wifi is connected
+  if (String(mqtt_server).length() > 0 && (1000 < millis() - lastMqttConnectionAttempt) && WiFi.isConnected() && !mqttClient.connected())
   {
-    if (connectMqtt())
-    {
-      needMqttConnect = false;
-    }
-  }
-  else if ((iotWebConf.getState() == iotwebconf::OnLine) && (!mqttClient .connected()))
-  {
-    Serial.println("MQTT reconnect");
+    Serial.println("Going to try and connect to MQTT");
     connectMqtt();
-  }
-
-  if (needReset)
-  {
-    Serial.println("Rebooting after 1 second.");
-    iotWebConf.delay(1000);
-    ESP.restart();
+    lastMqttConnectionAttempt = millis();
   }
 
   if(btConnected && !SerialBT.connected()){ //BT Serial connection has become disconnected
   Serial.println("BT Serial connection closed");
-  mqttLog("Bluetooth connection was unexpectedly closed");
   btConnected = SerialBT.connected();
   }
 
-if(mowerConnectParam.isChecked() && !btConnected && mqttClient.connected() && (lastBTConnectAttempt + 30000 < millis() || lastBTConnectAttempt == 0)){ //if we are wanting to be connected, and aren't already
+
+if(btConnect && !btConnected && (lastBTConnectAttempt + 30000 < millis() || lastBTConnectAttempt == 0)){ //if we are wanting to be connected, and aren't already
   
-      MatchState ms;
-      ms.Target(mowerMacAddressValue);
-      char result = ms.Match("^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]$");
-    if (result == REGEXP_MATCHED)
-    { 
-      String msg = "Attempting to connect to mower by MAC: " + String(mowerMacAddressValue);
-      Serial.print(msg);
-      mqttLog(msg);
-      
-
-      sscanf(mowerMacAddressValue, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mowerAddress[0], &mowerAddress[1], &mowerAddress[2], &mowerAddress[3], &mowerAddress[4], &mowerAddress[5]);
-        char* ptr; //start and end pointer for strtol
-
-        mowerAddress[0] = strtol(mowerMacAddressValue, &ptr, HEX );
-        for( uint8_t i = 1; i < 6; i++ )
-        {
-          mowerAddress[i] = strtol(ptr+1, &ptr, HEX );
-        }
+      Serial.print("Attempting to connect to mower by MAC: ");
+      Serial.println(mower_mac);
       SerialBT.connect(mowerAddress);
       lastBTConnectAttempt = millis();
-    }
-    else if(result == REGEXP_NOMATCH){
-      Serial.println("Not a valid MAC address");
-      scanOutput = "Scanning....<br><br>";
-      SerialBT.discoverAsync(handleBtDeviceFound, 25000);
-      lastBTConnectAttempt = millis();
-    }
-    else{
-      Serial.println("Regex parsing error");
-    }
+
   
   if(SerialBT.connected()){//connection has been made successfully
-    Serial.println("Connected Succesfully!");
-    mqttLog("Successfully connected to Bluetooth Device");
+    Serial.println("Connected to bluetooth device succesfully!");
     btConnected = SerialBT.connected();
-    mower.requestScheduleRefresh(0,1);
+    //mower.init();
   }
 }
-else if(!mowerConnectParam.isChecked() && btConnected){//we are connected but should be disconnected
+else if(!btConnect && btConnected){//we are connected but should be disconnected
+    Serial.println("Disconnected from Bluetooth Serial");
     SerialBT.disconnect();
-    mqttLog("Bluetooth disconnected");
-}
-  
 }
 
-/**
- * Handle web requests to "/" path.
- */
-void handleRoot()
-{
-  // -- Let IotWebConf test and handle captive portal requests.
-  if (iotWebConf.handleCaptivePortal())
-  {
-    // -- Captive portal request were already served.
-    return;
-  }
-  String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
-  s += "<title>" + String(thingName) + "</title></head><body>Bluetooth Serial Port to MQTT Bridge";
-  s += "<ul>";
-  s += "<li>MQTT server: ";
-  s += mqttServerValue;
-  s += "</li>";
-  s += "<li>MQTT Topic: ";
-  s += mqttTopic;
-  s += "</li>";
-  s += "</ul>";
-  s += "Go to <a href='config'>configure page</a> to change values.";
-  s += "<br><br><h3>Bluetooth Scan Output:</h3>";
-  s += scanOutput;
-  s += "</body></html>\n";
-
-  server.send(200, "text/html", s);
-}
-
-void wifiConnected()
-{
-  needMqttConnect = true;
-}
-
-void configSaved()
-{
-  Serial.println("Configuration was updated.");
-  needReset = true;
-}
-
-bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper)
-{
-  Serial.println("Validating form.");
-  bool valid = true;
-
-  int l = webRequestWrapper->arg(mqttServerParam.getId()).length();
-  if (l < 3)
-  {
-    mqttServerParam.errorMessage = "Please provide at least 3 characters!";
-    valid = false;
-  }
-
-  return valid;
-}
-
-bool connectMqtt() {
-  unsigned long now = millis();
-  if (1000 > now - lastMqttConnectionAttempt)
-  {
-    // Do not repeat within 1 sec.
-    return false;
-  }
-  Serial.println("Connecting to MQTT server...");
-  if (!connectMqttOptions()) {
-    lastMqttConnectionAttempt = now;
-    return false;
-  }
-  Serial.println("Connected!");
-
-  mqttClient.subscribe(mqttTopicSerialIn);
-  mqttClient.subscribe(mqttTopicJSONIn);
-  return true;
-}
-
-bool connectMqttOptions()
-{
-  bool result;
-  if (mqttUserPasswordValue[0] != '\0')
-  {
-    result = mqttClient.connect(iotWebConf.getThingName(), mqttUserNameValue, mqttUserPasswordValue);
-  }
-  else if (mqttUserNameValue[0] != '\0')
-  {
-    result = mqttClient.connect(iotWebConf.getThingName(), mqttUserNameValue);
-  }
-  else
-  {
-    result = mqttClient.connect(iotWebConf.getThingName());
-  }
-  return result;
-}
-
-void mqttMessageReceived(MQTTClient *client, char topic[], char bytes[], int length)
-{
-  //should only ever get messages on this topic as that's all that is subscribed, but check anyway
-  if(strcmp(topic, mqttTopicSerialIn.c_str()) == 0)
-  {
-    uint8_t data[length];
-    memcpy(data,bytes,length);
-    SerialBT.write(data,length);
-    }
-    else if(strcmp(topic, mqttTopicJSONIn.c_str()) == 0){
-      JsonDocument command;
-      DeserializationError error = deserializeJson(command, bytes, length);
-
+if(Serial.available() > 0){
+  JsonDocument command;
+  DeserializationError error = deserializeJson(command, Serial);
+  Serial.println(command["cmnd"].as<String>());
       if (error) {
         Serial.print(F("deserializeJson() failed: "));
         Serial.println(error.f_str());
         return;
       }
-      if(command["cmnd"] == "play" ){
-        mower.play();
-      }
-      if(command["cmnd"] == "pause" ){
-        mower.pause();
-      }
-      if(command["cmnd"] == "home" ){
-        mower.goHome();
-      }
-    }
+    processCommand(command);
 }
+  
+}
+
 
 void btDataAvailable(const uint8_t *buffer, size_t size){
   char message[size];
@@ -392,6 +255,9 @@ void btDataAvailable(const uint8_t *buffer, size_t size){
 }
 
 void writeToBluetoothSerial(const uint8_t *buffer, size_t size){
+  while(millis()-lastSentToBt < 50){ //delay a while to avoid overloading the send buffer
+    delay(10);
+  }
   if(SerialBT.connected()){
   SerialBT.write(buffer,size);
   lastSentToBt = millis();
@@ -407,40 +273,63 @@ void printMsg(char* msg, uint8_t len, uint8_t offset1, uint8_t offset2) {
   Serial.println();
 }
 
-void handleBtDeviceFound(BTAdvertisedDevice *device){
-      scanOutput += "<br>";
-      scanOutput += device->getAddress().toString(true);
-      scanOutput += " - ";
-      scanOutput += device->getName().c_str();
+bool validateMAC(char *mac){
+  MatchState ms;
+  ms.Target(mac);
+  char result = ms.Match("^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]$");
+    if (result == REGEXP_MATCHED)
+    { 
+      Serial.println("MAC address is valid");
+      return true;
+    }
+   else if(result == REGEXP_NOMATCH){
+      Serial.println("Not a valid MAC address");
+      return false;
+    }
+    else{
+      Serial.println("Regex parsing error");
+      return false;
+    }
 }
 
 void handleInfoMessage(AM4000_Info info){
   JsonDocument doc;
-  doc["typ"] = "info";
+  doc["type"] = "info";
   doc["volt"] = info._batteryVoltage;
   doc["batt"] = info._batteryPercent;
   doc["curr"] = info._current;
-  char buffer[256];
+  String buffer;
   size_t n = serializeJson(doc,buffer);
-  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+  bool sendMesh = false;
+   if(millis() > lastInfoMessageSent + 15000){
+    lastInfoMessageSent = millis();
+    sendMesh = true;
+  }
+  outputMessage(buffer,true,sendMesh);
 }
 
 void handleStateMessage(AM4000_State state){
+  if(state != previousState ){
   JsonDocument doc;
   doc["type"] = "stat";
   doc["stat"] = stateToString[state];
   char buffer[256];
   size_t n = serializeJson(doc,buffer);
-  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+  outputMessage(buffer,true,true);
+  previousState = state;
+  }
 }
 
 void handleMessageMessage(AM4000_Message message){
+  if(message != previousMessage){
   JsonDocument doc;
   doc["type"] = "mesg";
   doc["mesg"] = messageToString[message];
   char buffer[256];
   size_t n = serializeJson(doc,buffer);
-  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+  outputMessage(buffer,true,true);
+  previousMessage = message;
+  }
 }
 
 void handleFailureMessage(AM4000_Failure failure){
@@ -449,42 +338,75 @@ void handleFailureMessage(AM4000_Failure failure){
   doc["fail"] = failureToString[failure];
   char buffer[256];
   size_t n = serializeJson(doc,buffer);
-  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
+  outputMessage(buffer,true,true);
 }
 
 void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, uint8_t dayIndex, uint8_t areaIndex){
-  Serial.println("handling command response");
- if(commandType == COMMS_SCHEDULE_SETTINGS_GET){
-  Serial.println("command response is a schedule");
+  Serial.print("handling command response: ");
+  Serial.println(commandType);
   JsonDocument doc;
+if(commandType == COMMS_SCHEDULE_SETTINGS_GET){
+  Serial.println("command response is a schedule");
   doc["type"] = "sche";
-  doc["idx"] = profileIndex;
-  doc["day"] = areaIndex;
+  doc["pid"] = profileIndex;
+  doc["did"] = dayIndex;
   doc["rain"] = mower.getSettingsProfile(profileIndex)._settingsRobot._rainSensor;
-  JsonArray areas = doc.add<JsonArray>();
+  JsonArray cycles = doc["cycles"].to<JsonArray>();
   for(uint8_t i=0;i<=3;i++){
-    JsonObject area = areas.add<JsonObject>();
-    area["bh"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._startHour;
-    area["bm"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._startMinute;
-    area["eh"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._stopHour;
-    area["em"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._stopMinute;
-    String areas;
-    areas = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area1 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area2 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area3 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area4 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area5 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area6 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area7 ? "Y" : "N";
-    areas += mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area8 ? "Y" : "N";
-    area["ar"] = areas;
-    area["bo"] = mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._borderCut ? "Y" : "N";
+    JsonArray cycle = cycles.add<JsonArray>();
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._startHour);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._startMinute);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._stopHour);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._stopMinute);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area1 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area2 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area3 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area4 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area5 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area6 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area7 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._area8 ? 1 : 0);
+    cycle.add(mower.getSettingsProfile(profileIndex)._settingsSchedules[dayIndex]._cycles[i]._borderCut ? 1 : 0);
+}
+}
+if(commandType == COMMS_AREA_SETTINGS_GET){
+    Serial.println("command response is an area");
+
+    doc["type"] = "area";
+    doc["aid"] = areaIndex;
+    doc["dim"] = mower.getSettingsArea(areaIndex)._dimension;
+    doc["dist"] = mower.getSettingsArea(areaIndex)._distance;
+    doc["flag"] = mower.getSettingsArea(areaIndex)._flags;
+    doc["wire"] = mower.getSettingsArea(areaIndex)._onWire;
+    
+  }
+  if(commandType == COMMS_ROBOT_SETTINGS_GET){
+    Serial.println("command response is robot settings");
+    doc["type"] = "robot";
+    doc["pid"] = profileIndex;
+    doc["bladeheight"] = mower.getSettingsRobot(profileIndex)._bladeHeight;
+    doc["grass"] = mower.getSettingsRobot(profileIndex)._grassSensibility;
+    doc["onwire"] = mower.getSettingsRobot(profileIndex)._onWire;
+    doc["rain"] = mower.getSettingsRobot(profileIndex)._rainSensor;
+  }
+  if(commandType == COMMS_GET_CONFIG){
+    doc["type"] = "config";
+    doc["model"] = mower.getModelType();
+  }
+  if(commandType == COMMS_MISC_SETTINGS_GET){
+    doc["type"] = "misc";
+    doc["pid"] = mower.getActiveProfile();
+    doc["manual"] = mower.getManualMode();
+  }
+  if(commandType == COMMS_FACTORY_SETTINGS_GET){
+    doc["type"] = "factory";
+    doc["serialnum"] = mower.getSerialNumber();
   }
   char buffer[256];
-  size_t n = serializeJson(doc,buffer);
-  mqttClient.publish(mqttTopicJSONOut.c_str(),buffer, n);
- }
+    size_t n = serializeJson(doc,buffer);
+  outputMessage(buffer,true,true);
 }
+
 
 void handleSettingsProfile(uint8_t profile){
 
@@ -493,8 +415,162 @@ void handleSettingsMisc(AM4000_SettingsMisc misc){
 
 }
 
-void mqttLog(String message){
+void saveParamsCallback () {
+  strcpy(mower_name, custom_mower_name->getValue());
+  strcpy(mqtt_server, custom_mqtt_server->getValue());
+  mqtt_port = atoi(custom_mqtt_port->getValue());
+  strcpy(mqtt_username, custom_mqtt_username->getValue());
+  strcpy(mqtt_password, custom_mqtt_password->getValue());
+  strcpy(mqtt_topic, custom_mqtt_topic->getValue());
+  strcpy(mower_mac, custom_mower_mac->getValue());
+
+  if(validateMAC(mower_mac)){   
+    sscanf(mower_mac, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mowerAddress[0], &mowerAddress[1], &mowerAddress[2], &mowerAddress[3], &mowerAddress[4], &mowerAddress[5]);
+    prefs.putBytes("mowerAddress",mowerAddress,6);
+  }
+  prefs.putString("mower_name", mower_name);
+  prefs.putString("mqtt_server", mqtt_server);
+  prefs.putInt("mqtt_port", mqtt_port);
+  prefs.putString("mqtt_username", mqtt_username);
+  prefs.putString("mqtt_password", mqtt_password);
+  prefs.putString("mqtt_topic", mqtt_topic);
+  btConnect = strncmp(custom_btConnect->getValue(), "T", 1) == 0;
+  prefs.putBool("btConnect", btConnect);
+}
+
+void bindServerCallback()
+{
+  wm.server->on("/btscan", handleRoute); // this is now crashing esp32 for some reason
+  // wm.server->on("/info",handleRoute); // you can override wm!
+}
+
+void handleRoute()
+{
+  if((millis() - btScanStarted > 25000 || btScanStarted == 0)){
+    if(resultsReturned){
+    scanResults = "";
+
+    SerialBT.discoverAsync(handleBtDeviceFound, 25000);
+    wm.server->send(200, "text/html", "<html><head><title>Bluetooth Scan Results</title><meta http-equiv=\"refresh\" content=\"5\" /></head><body>Bluetooth scan has started.<br><br>This page will refresh automatically until results are available.</body></html>");
+    btScanStarted = millis();
+    resultsReturned = false;
+    }
+    else{
+      scanResults += "<br><br>Scan complete. Refresh again to rescan.";
+      wm.server->send(200, "text/html", scanResults);
+      resultsReturned = true;
+    }
+  }
+  wm.server->send(200, "text/html", "<html><head><title>Bluetooth Scan Results</title><meta http-equiv=\"refresh\" content=\"5\" /></head><body>Bluetooth scan in progress.<br><br>This page will refresh automatically until results are available.</body></html>"); 
+}
+
+void handleBtDeviceFound(BTAdvertisedDevice *device){
+      scanResults += "<br>";
+      scanResults += device->getAddress().toString(true);
+      scanResults += " - ";
+      scanResults += device->getName().c_str();
+}
+
+void connectMqtt() {
+  
+  if(connectMqttOptions()){
+  mqttClient.subscribe(mqttTopicJSONIn);
+  Serial.println("Connected!");
+  }
+  else{
+    Serial.println("Unable to connect to MQTT!");
+  }
+
+}
+
+bool connectMqttOptions()
+{
+  bool result;
+  if (String(mqtt_username).length() > 0)
+  {
+    result = mqttClient.connect(mqtt_server, mqtt_username, mqtt_password);
+  }
+  else
+  {
+    result = mqttClient.connect(mqtt_server);
+  }
+  return result;
+}
+
+void outputMessage(String msg, bool sendMQTT, bool sendMesh){
   if(mqttClient.connected()){
-    mqttClient.publish(mqttTopicLog.c_str(),message);
+    Serial.println("MQTT is connected. Publishing message");
+    mqttClient.publish(mqttTopicJSONOut.c_str(),msg);
+  } else {
+    Serial.println("MQTT not connected. Not publishing message");
+  }
+  Serial.println(msg);
+  if(meshAvailable){
+    Serial.println("MESH is available. Publishing message");
+    mt_send_text(msg.c_str(), BROADCAST_ADDR, 1);
+  }
+  //
+}
+
+void mqttMessageReceived(MQTTClient *client, char topic[], char bytes[], int length)
+{
+  //should only ever get messages on this topic as that's all that is subscribed, but check anyway
+if(strcmp(topic, mqttTopicJSONIn.c_str()) == 0){
+      JsonDocument command;
+      DeserializationError error = deserializeJson(command, bytes, length);
+
+      if (error) {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.f_str());
+        return;
+      }
+      processCommand(command);
+    }
+}
+
+void processCommand(JsonDocument command){
+if(command["cmnd"] == "sys" ){
+  if(command["type"] == "mac"){
+    const char* newMAC = command["mac"].as<const char*>();
+    validateMAC((char*)newMAC);
+  }
+  if(command["type"] == "con"){
+    Serial.println(command["con"].as<String>());
+    btConnect = command["con"].as<bool>();
+    Serial.print("btConnect is now: ");
+    Serial.println(btConnect);
+    prefs.putBool("btConnect",btConnect);
+  }
+  if(command["type"] == "scan"){
+    Serial.println(command["scan"].as<String>());
+    scan = command["scan"].as<bool>();
+    Serial.print("scan is now: ");
+    Serial.println(scan);
+  }
+}
+if(command["cmnd"] == "play" ){
+  mower.play();
+}
+if(command["cmnd"] == "pause" ){
+  mower.pause();
+}
+if(command["cmnd"] == "home" ){
+  mower.goHome();
+}
+if(command["cmnd"] == "work" ){
+  mower.workUntil(command["hh"],command["mm"],command["areas"][0],command["areas"][1],command["areas"][2],command["areas"][3],command["areas"][4],command["areas"][5],command["areas"][6],command["areas"][7]);
+}
+if(command["cmnd"] == "get" ){
+  if(command["type"] == "sche"){
+    mower.requestScheduleRefresh(command["prof"],command["day"]);
+  }
+  if(command["type"] == "area"){
+    mower.requestAreaSettingsRefresh(command["aid"]);
+  }
+  }
+  if(command["cmnd"] == "set" ){
+    if(command["type"] == "manual"){
+      mower.setManualMode(command["manual"]);
+    }
   }
 }
