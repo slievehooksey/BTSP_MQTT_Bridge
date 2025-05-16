@@ -6,7 +6,8 @@
 #include <Preferences.h>
 #include <WiFiManager.h> 
 #include <MQTT.h>
-#include <Meshtastic.h>
+//#include <Meshtastic.h>
+//#include <ArduinoOTA.h>
 
 Preferences prefs;
 WiFiClient net;
@@ -22,14 +23,22 @@ char mqtt_topic[40] = "ambrogio";
 char mower_mac[18];
 char checkbox_btConnect[2];
 String customHtml_checkbox = "type=\"checkbox\"";
+int mesh_uplink_id; //this is the id of the node that has the connection to the MQTT server. We will send our messages directly to this node
+int mesh_channel_id; //the ID of the 'mqtt' channel that will be used to send and receive messages on.
+
 long btScanStarted = 0;
 bool resultsReturned = true;
+uint8_t btDevicesDiscovered;
 String scanResults;
 
 bool meshAvailable;
+bool meshNotYetConnected = true;
+//void handleMeshMessage(uint32_t from, uint32_t to,  uint8_t channel, const char* text);
+//void connected_callback(mt_node_t *node, mt_nr_progress_t progress);
 
 void printMsg(char* msg, uint8_t len, uint8_t offset1 = 0, uint8_t offset2 = 0);
 bool validateMAC(char *mac);
+void log(String msg);
 
 // -- Bluetooth callbacks
 void btDataAvailable(const uint8_t *buffer, size_t size);
@@ -56,6 +65,7 @@ bool connectMqttOptions();
 void bindServerCallback();
 void handleRoute();
 void saveParamsCallback ();
+void preOTA();
 
 MQTTClient mqttClient(256); //128 is default but payloads can be up to 256
 
@@ -63,17 +73,20 @@ String mqttBase;
 String mqttTopicJSONIn;
 String mqttTopicJSONOut;
 
-bool needMqttConnect = false;
+bool needMqttConnect = true;
 
 WiFiManager wm;
+WiFiManagerParameter *custom_mower_mac;
+WiFiManagerParameter *custom_btConnect;
 WiFiManagerParameter *custom_mower_name;
 WiFiManagerParameter *custom_mqtt_server;
 WiFiManagerParameter *custom_mqtt_port;
 WiFiManagerParameter *custom_mqtt_username;
 WiFiManagerParameter *custom_mqtt_password;
 WiFiManagerParameter *custom_mqtt_topic;
-WiFiManagerParameter *custom_mower_mac;
-WiFiManagerParameter *custom_btConnect;
+WiFiManagerParameter *custom_mesh_uplink_id;
+WiFiManagerParameter *custom_mesh_channel_id;
+
 
 BluetoothSerial SerialBT;
 AM4000 mower;
@@ -94,18 +107,23 @@ unsigned long lastMqttConnectionAttempt = 0;
 unsigned long lastSentToBt = 0;
 
 
+
 void setup() 
 {
   Serial.begin(115200);
   Serial.println();
   Serial.println("Starting up...");
-  mt_serial_init(16, 17);
+  //mt_set_debug(true);
+  //randomSeed(micros());
+  //mt_serial_init(16, 17, 115200);
+  //set_text_message_callback(handleMeshMessage);
+  //mt_request_node_report(connected_callback);
 
   WiFi.mode(WIFI_STA);
 
   prefs.begin("ambrogio");
-  prefs.getBytes("mowerAddress",mowerAddress,6);
-  btConnect = prefs.getBool("btConnect");
+  
+  
   //set callbacks to pass data back and forth between the library and the bluetooth mower connection.
   mower.setSerialDataOutputCallack(writeToBluetoothSerial);
   SerialBT.onData(btDataAvailable);
@@ -117,25 +135,37 @@ void setup()
   mower.setNotificationMessageCallback(handleMessageMessage);
   mower.setNotificationCommandResponseCallback(handleCommandResponse);
 
+  prefs.getBytes("mowerAddress",mowerAddress,6);
+  sprintf(mower_mac,  "%02X:%02X:%02X:%02X:%02X:%02X", mowerAddress[0], mowerAddress[1], mowerAddress[2], mowerAddress[3], mowerAddress[4],mowerAddress[5]);
+  btConnect = prefs.getBool("btConnect");
   strcpy(mower_name, prefs.getString("mower_name", "mower").c_str());
+
   strcpy(mqtt_server, prefs.getString("mqtt_server", "").c_str());
   mqtt_port = prefs.getInt("mqtt_port", 1883);
   strcpy(mqtt_username, prefs.getString("mqtt_username", "").c_str());
   strcpy(mqtt_password, prefs.getString("mqtt_password", "").c_str());
   strcpy(mqtt_topic, prefs.getString("mqtt_topic", "ambrogio").c_str());
-  sprintf(mower_mac,  "%02X:%02X:%02X:%02X:%02X:%02X", mowerAddress[0], mowerAddress[1], mowerAddress[2], mowerAddress[3], mowerAddress[4],mowerAddress[5]);
 
+  mesh_uplink_id = prefs.getInt("mesh_uplink_id",0);
+  mesh_channel_id = prefs.getInt("mesh_channel_id",0);
+
+  custom_mower_mac = new WiFiManagerParameter("mac", "Mower MAC Address", mower_mac, 17);
+    if (btConnect) {
+      customHtml_checkbox += " checked=\"true\"";
+    }
+  custom_btConnect = new WiFiManagerParameter("btConnect", "Connect to Mower", "T", 2, customHtml_checkbox.c_str());
   custom_mower_name = new WiFiManagerParameter("mower_name", "Mower Name", mower_name, 40);
   custom_mqtt_server = new WiFiManagerParameter("server", "MQTT Server", mqtt_server, 40);
   custom_mqtt_port = new WiFiManagerParameter("port", "MQTT Port", String(mqtt_port).c_str(), 6);
   custom_mqtt_username = new WiFiManagerParameter("username", "MQTT Username", mqtt_username, 40);
-  custom_mqtt_password = new WiFiManagerParameter("password", "MQTT Password", mqtt_password, 40);//, "type='password'");
+  custom_mqtt_password = new WiFiManagerParameter("password", "MQTT Password", mqtt_password, 40, "type='password'");
   custom_mqtt_topic = new WiFiManagerParameter("topic", "MQTT Topic", mqtt_topic, 40);
-  custom_mower_mac = new WiFiManagerParameter("mac", "Mower MAC Address", mower_mac, 17);
-    if (btConnect) {
-      customHtml_checkbox += " checked";
-    }
-  custom_btConnect = new WiFiManagerParameter("btConnect", "Connect to Mower", "T", 2, customHtml_checkbox.c_str(), WFM_LABEL_AFTER);
+
+  custom_mesh_uplink_id = new WiFiManagerParameter("mesh_uplink_id","Meshtastic Uplink Node Number", String(mesh_uplink_id).c_str(), 12);
+  custom_mesh_channel_id = new WiFiManagerParameter("mesh_channel_id","Meshtastic Channel ID", String(mesh_channel_id).c_str(), 1);
+
+  wm.addParameter(custom_mower_mac);
+  wm.addParameter(custom_btConnect);
 
   wm.addParameter(custom_mower_name);
   wm.addParameter(custom_mqtt_server);
@@ -143,13 +173,19 @@ void setup()
   wm.addParameter(custom_mqtt_username);
   wm.addParameter(custom_mqtt_password);
   wm.addParameter(custom_mqtt_topic);
-  wm.addParameter(custom_mower_mac);
-  wm.addParameter(custom_btConnect);
+
+  wm.addParameter(custom_mesh_uplink_id);
+  wm.addParameter(custom_mesh_channel_id);
 
   wm.setCustomHeadElement("<style>body{max-width:500px;margin:auto}</style>");
+  const char* menuhtml = "<form action='/btscan' method='get'><button>Bluetooth Scan</button></form><br/>\n";
+  wm.setCustomMenuHTML(menuhtml);
+  const char* menu[] = {"wifi","wifinoscan","info","param","close","sep","erase","restart","exit","update","sep","custom"};
+  wm.setMenu(menu,12); // custom menu array must provide length
 
   wm.setSaveParamsCallback(saveParamsCallback);
   wm.setWebServerCallback(bindServerCallback);
+  wm.setPreOtaUpdateCallback(preOTA);
 
   wm.setConfigPortalBlocking(true);
   if(wm.getWiFiIsSaved()){
@@ -176,19 +212,63 @@ void setup()
   mqttClient.begin(mqtt_server, net);
   mqttClient.onMessageAdvanced(mqttMessageReceived);
 
+
+/*   ArduinoOTA
+    .onStart([]() {
+      needMqttConnect = false;
+      mqttClient.disconnect();
+      btConnect = false;
+      SerialBT.disconnect();
+      SerialBT.end();
+      wm.stopWebPortal();
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH) {
+        type = "sketch";
+      } else {  // U_SPIFFS
+        type = "filesystem";
+      }
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) {
+        Serial.println("Auth Failed");
+      } else if (error == OTA_BEGIN_ERROR) {
+        Serial.println("Begin Failed");
+      } else if (error == OTA_CONNECT_ERROR) {
+        Serial.println("Connect Failed");
+      } else if (error == OTA_RECEIVE_ERROR) {
+        Serial.println("Receive Failed");
+      } else if (error == OTA_END_ERROR) {
+        Serial.println("End Failed");
+      }
+    }); */
+
+  //ArduinoOTA.begin(); 
+
   SerialBT.begin("Ambrogio BTSerial Bridge", true);
-  Serial.println("Ready.");
+
+  Serial.println("Startup complete.3");
 }
 
 
 void loop() 
 {
+  //ArduinoOTA.handle();
   wm.process();
   mqttClient.loop();
-  meshAvailable = mt_loop(millis());
+  //meshAvailable = mt_loop(millis());
   
   // if there is an MQTT server configured, it is more than 1 second since we last tried AND wifi is connected
-  if (String(mqtt_server).length() > 0 && (1000 < millis() - lastMqttConnectionAttempt) && WiFi.isConnected() && !mqttClient.connected())
+  if (String(mqtt_server).length() > 0 && (1000 < millis() - lastMqttConnectionAttempt) && WiFi.isConnected() && !mqttClient.connected() && needMqttConnect)
   {
     Serial.println("Going to try and connect to MQTT");
     connectMqtt();
@@ -202,9 +282,8 @@ void loop()
 
 
 if(btConnect && !btConnected && (lastBTConnectAttempt + 30000 < millis() || lastBTConnectAttempt == 0)){ //if we are wanting to be connected, and aren't already
-  
-      Serial.print("Attempting to connect to mower by MAC: ");
-      Serial.println(mower_mac);
+  String msg = "Attempting to connect to mower by MAC: " + String(mower_mac);
+  log(msg);
       SerialBT.connect(mowerAddress);
       lastBTConnectAttempt = millis();
 
@@ -225,8 +304,8 @@ if(Serial.available() > 0){
   DeserializationError error = deserializeJson(command, Serial);
   Serial.println(command["cmnd"].as<String>());
       if (error) {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.f_str());
+        //Serial.print(F("deserializeJson() failed: "));
+        //Serial.println(error.f_str());
         return;
       }
     processCommand(command);
@@ -247,7 +326,7 @@ void btDataAvailable(const uint8_t *buffer, size_t size){
       uint8_t packet[length];
       memcpy(packet,buffer+frameStart,length);
       //mqttClient.publish(mqttTopicSerialOut.c_str(),packet,length);
-      ESP_LOGD(TAG, "Sending data received from mower to library" );
+      //ESP_LOGD(TAG, "Sending data received from mower to library" );
       mower.serialInput(packet,length);
       frameStart = i + 1;
     }
@@ -342,11 +421,11 @@ void handleFailureMessage(AM4000_Failure failure){
 }
 
 void handleCommandResponse(AM4000_Commands commandType, uint8_t profileIndex, uint8_t dayIndex, uint8_t areaIndex){
-  Serial.print("handling command response: ");
+  //Serial.print("handling command response: ");
   Serial.println(commandType);
   JsonDocument doc;
 if(commandType == COMMS_SCHEDULE_SETTINGS_GET){
-  Serial.println("command response is a schedule");
+  //Serial.println("command response is a schedule");
   doc["type"] = "sche";
   doc["pid"] = profileIndex;
   doc["did"] = dayIndex;
@@ -370,7 +449,7 @@ if(commandType == COMMS_SCHEDULE_SETTINGS_GET){
 }
 }
 if(commandType == COMMS_AREA_SETTINGS_GET){
-    Serial.println("command response is an area");
+    //Serial.println("command response is an area");
 
     doc["type"] = "area";
     doc["aid"] = areaIndex;
@@ -381,7 +460,7 @@ if(commandType == COMMS_AREA_SETTINGS_GET){
     
   }
   if(commandType == COMMS_ROBOT_SETTINGS_GET){
-    Serial.println("command response is robot settings");
+    //Serial.println("command response is robot settings");
     doc["type"] = "robot";
     doc["pid"] = profileIndex;
     doc["bladeheight"] = mower.getSettingsRobot(profileIndex)._bladeHeight;
@@ -416,26 +495,34 @@ void handleSettingsMisc(AM4000_SettingsMisc misc){
 }
 
 void saveParamsCallback () {
+
+  strcpy(mower_mac, custom_mower_mac->getValue());
+  if(validateMAC(mower_mac)){   
+    sscanf(mower_mac, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mowerAddress[0], &mowerAddress[1], &mowerAddress[2], &mowerAddress[3], &mowerAddress[4], &mowerAddress[5]);
+    prefs.putBytes("mowerAddress",mowerAddress,6);
+  }
+  btConnect = strncmp(custom_btConnect->getValue(), "T", 1) == 0;
+  prefs.putBool("btConnect", btConnect);
   strcpy(mower_name, custom_mower_name->getValue());
+
   strcpy(mqtt_server, custom_mqtt_server->getValue());
   mqtt_port = atoi(custom_mqtt_port->getValue());
   strcpy(mqtt_username, custom_mqtt_username->getValue());
   strcpy(mqtt_password, custom_mqtt_password->getValue());
   strcpy(mqtt_topic, custom_mqtt_topic->getValue());
-  strcpy(mower_mac, custom_mower_mac->getValue());
 
-  if(validateMAC(mower_mac)){   
-    sscanf(mower_mac, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mowerAddress[0], &mowerAddress[1], &mowerAddress[2], &mowerAddress[3], &mowerAddress[4], &mowerAddress[5]);
-    prefs.putBytes("mowerAddress",mowerAddress,6);
-  }
+  mesh_uplink_id = atoi(custom_mesh_uplink_id->getValue());
+  mesh_channel_id = atoi(custom_mesh_channel_id->getValue());
+
   prefs.putString("mower_name", mower_name);
   prefs.putString("mqtt_server", mqtt_server);
   prefs.putInt("mqtt_port", mqtt_port);
   prefs.putString("mqtt_username", mqtt_username);
   prefs.putString("mqtt_password", mqtt_password);
   prefs.putString("mqtt_topic", mqtt_topic);
-  btConnect = strncmp(custom_btConnect->getValue(), "T", 1) == 0;
-  prefs.putBool("btConnect", btConnect);
+  prefs.putInt("mesh_uplink_id", mesh_uplink_id);
+  prefs.putInt("mesh_channel_id", mesh_channel_id);
+
 }
 
 void bindServerCallback()
@@ -446,22 +533,24 @@ void bindServerCallback()
 
 void handleRoute()
 {
+  String html = F("<html><head><title>Bluetooth Scan Results</title><meta http-equiv=\"refresh\" content=\"5\" /></head><body>Bluetooth scan in progress.<br><br>This page will refresh automatically until results are available.</body></html>");
+
   if((millis() - btScanStarted > 25000 || btScanStarted == 0)){
     if(resultsReturned){
     scanResults = "";
-
+    btDevicesDiscovered = 0;
     SerialBT.discoverAsync(handleBtDeviceFound, 25000);
-    wm.server->send(200, "text/html", "<html><head><title>Bluetooth Scan Results</title><meta http-equiv=\"refresh\" content=\"5\" /></head><body>Bluetooth scan has started.<br><br>This page will refresh automatically until results are available.</body></html>");
+    wm.server->send(200, "text/html", html);
     btScanStarted = millis();
     resultsReturned = false;
     }
     else{
       scanResults += "<br><br>Scan complete. Refresh again to rescan.";
-      wm.server->send(200, "text/html", scanResults);
+      wm.server->send(200, "text/html", String(btDevicesDiscovered) + " device(s) found." + scanResults);
       resultsReturned = true;
     }
   }
-  wm.server->send(200, "text/html", "<html><head><title>Bluetooth Scan Results</title><meta http-equiv=\"refresh\" content=\"5\" /></head><body>Bluetooth scan in progress.<br><br>This page will refresh automatically until results are available.</body></html>"); 
+  wm.server->send(200, "text/html", html); 
 }
 
 void handleBtDeviceFound(BTAdvertisedDevice *device){
@@ -469,6 +558,7 @@ void handleBtDeviceFound(BTAdvertisedDevice *device){
       scanResults += device->getAddress().toString(true);
       scanResults += " - ";
       scanResults += device->getName().c_str();
+      btDevicesDiscovered++;
 }
 
 void connectMqtt() {
@@ -498,16 +588,17 @@ bool connectMqttOptions()
 }
 
 void outputMessage(String msg, bool sendMQTT, bool sendMesh){
-  if(mqttClient.connected()){
-    Serial.println("MQTT is connected. Publishing message");
+  if(sendMQTT && mqttClient.connected()){
+    //Serial.println("MQTT is connected. Publishing message");
     mqttClient.publish(mqttTopicJSONOut.c_str(),msg);
   } else {
-    Serial.println("MQTT not connected. Not publishing message");
+    //Serial.println("MQTT not connected. Not publishing message");
   }
-  Serial.println(msg);
-  if(meshAvailable){
-    Serial.println("MESH is available. Publishing message");
-    mt_send_text(msg.c_str(), BROADCAST_ADDR, 1);
+  //Serial.println(msg);
+  if(sendMesh && meshAvailable && !meshNotYetConnected && mesh_uplink_id > 0){
+    //Serial.println("MESH is available. Publishing message");
+    //Serial.println(mesh_channel_id);
+    //mt_send_text(msg.c_str(), mesh_uplink_id, mesh_channel_id);
   }
   //
 }
@@ -520,8 +611,8 @@ if(strcmp(topic, mqttTopicJSONIn.c_str()) == 0){
       DeserializationError error = deserializeJson(command, bytes, length);
 
       if (error) {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.f_str());
+        //Serial.print(F("deserializeJson() failed: "));
+        //Serial.println(error.f_str());
         return;
       }
       processCommand(command);
@@ -535,17 +626,17 @@ if(command["cmnd"] == "sys" ){
     validateMAC((char*)newMAC);
   }
   if(command["type"] == "con"){
-    Serial.println(command["con"].as<String>());
+   // Serial.println(command["con"].as<String>());
     btConnect = command["con"].as<bool>();
-    Serial.print("btConnect is now: ");
-    Serial.println(btConnect);
+   // Serial.print("btConnect is now: ");
+   // Serial.println(btConnect);
     prefs.putBool("btConnect",btConnect);
   }
   if(command["type"] == "scan"){
-    Serial.println(command["scan"].as<String>());
+    //Serial.println(command["scan"].as<String>());
     scan = command["scan"].as<bool>();
-    Serial.print("scan is now: ");
-    Serial.println(scan);
+    //Serial.print("scan is now: ");
+    //Serial.println(scan);
   }
 }
 if(command["cmnd"] == "play" ){
@@ -573,4 +664,50 @@ if(command["cmnd"] == "get" ){
       mower.setManualMode(command["manual"]);
     }
   }
+}
+
+/* void handleMeshMessage(uint32_t from, uint32_t to,  uint8_t channel, const char* text) {
+  // Do your own thing here. This example just prints the message to the serial console.
+  Serial.print("Received a text message on channel: ");
+  Serial.print(channel);
+  Serial.print(" from: ");
+  Serial.print(from);
+  Serial.print(" to: ");
+  Serial.print(to);
+  Serial.print(" message: ");
+  Serial.println(text);
+  if (to == 0xFFFFFFFF){
+    Serial.println("This is a BROADCAST message.");
+  } else if (to == my_node_num){
+    Serial.println("This is a DM to me!");
+  } else {
+    Serial.println("This is a DM to someone else.");
+  }
+} */
+
+void log(String msg){
+  Serial.println(msg);
+  JsonDocument doc;
+  doc["type"] = "log";
+  doc["msg"] = msg;
+  char buffer[256];
+  size_t n = serializeJson(doc,buffer);
+  outputMessage(buffer,true,true);
+}
+
+// This callback function will be called whenever the radio connects to a node
+//void connected_callback(mt_node_t *node, mt_nr_progress_t progress) {
+//  if (meshNotYetConnected) 
+//    Serial.println("Connected to Meshtastic device!");
+//  meshNotYetConnected = false;
+//}
+
+void preOTA(){
+  Serial.println("Closing connections to free up memory for OTA");
+  prefs.end();
+  needMqttConnect = false;
+  mqttClient.disconnect();
+  btConnect = false;
+  SerialBT.disconnect();
+  SerialBT.end();
 }
